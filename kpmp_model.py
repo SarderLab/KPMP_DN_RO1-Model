@@ -64,27 +64,85 @@ class CrossAttentionBlock(nn.Module):
         return out, attn_weights
 
 
-class LesionEncoder(nn.Module):
-    """Learnable lesion encoder for generating lesion-specific embeddings"""
-    def __init__(self, num_lesions=2, embed_dim=768):
+class LesionEmbeddingModule(nn.Module):
+    """Multi-head lesion embedding module for generating lesion-specific embeddings"""
+    def __init__(self, glom_dim=768, num_lesion_types=5, lesion_embed_dim=768, hidden_dim=512, dropout=0.1):
         super().__init__()
-        # Learnable embeddings for each lesion type
-        self.lesion_embeddings = nn.Parameter(torch.randn(num_lesions, embed_dim))
+        self.glom_dim = glom_dim
+        self.num_lesion_types = num_lesion_types  # Now supports N lesion types
+        self.lesion_embed_dim = lesion_embed_dim
         
-        # Transform to generate final lesion encodings
+        # Shared encoder for all gloms
         self.encoder = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
+            nn.Linear(glom_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim//2, hidden_dim//4),
+            nn.LayerNorm(hidden_dim//4)
         )
         
-    def forward(self, batch_size):
-        """Generate lesion encodings for the batch"""
-        lesion_encodings = self.encoder(self.lesion_embeddings)
-        return lesion_encodings.unsqueeze(0).expand(batch_size, -1, -1)
+        # Multiple projection heads for different lesion types
+        # Creates N heads for N lesion types: y¹ᴸ, y²ᴸ, ..., yᴺᴸ
+        self.lesion_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim//4, hidden_dim//2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim//2, lesion_embed_dim),
+                nn.LayerNorm(lesion_embed_dim)
+            ) for _ in range(num_lesion_types)  # N heads for N lesion types
+        ])
+        
+        # Lesion classifier from bottleneck - outputs N lesion probabilities
+        self.lesion_classifier = nn.Sequential(
+            nn.Linear(hidden_dim//4, hidden_dim//8),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim//8, num_lesion_types)  # Outputs N lesion scores
+        )
+        
+    def forward(self, glom_features):
+        """Generate lesion embeddings for each glom"""
+        # Encode gloms to bottleneck representation
+        encoded = self.encoder(glom_features)
+        
+        # Generate multiple lesion embeddings using different heads
+        lesion_embeddings = []
+        for head in self.lesion_heads:
+            lesion_emb = head(encoded)
+            lesion_embeddings.append(lesion_emb)
+        
+        # Stack to get [B, G, num_lesion_types, lesion_embed_dim]
+        # For 5 lesions: [B, G, 5, 768] - 5 different embeddings per glom
+        lesion_embeddings = torch.stack(lesion_embeddings, dim=2)
+        
+        # Classify lesions from bottleneck - [B, G, num_lesion_types] 
+        # For 5 lesions: [B, G, 5] - probability for each lesion type
+        lesion_logits = self.lesion_classifier(encoded)
+        
+        return lesion_embeddings, lesion_logits
+    
+    def get_lesion_embeddings_for_cross_attention(self, lesion_embeddings):
+        """Extract lesion embeddings for cross-attention"""
+        # lesion_embeddings: [B, G, N, embed_dim] where N = number of lesion types
+        # Returns: [B, N, embed_dim] - one embedding per lesion type for cross-attention
+        return lesion_embeddings.mean(dim=1)  # Average across gloms for each lesion type
+    
+    def compute_lesion_loss(self, lesion_logits, lesion_labels):
+        """
+        Compute lesion classification loss
+        For multi-class: lesion_labels should be class indices [0, 1, 2, 3, 4]
+        For multi-label: lesion_labels should be binary [0,1] for each lesion type
+        """
+        if lesion_labels.dim() == 2 and lesion_labels.shape[-1] == self.num_lesion_types:
+            # Multi-label case: lesion_labels is [B, G, N] with binary indicators
+            return F.binary_cross_entropy_with_logits(lesion_logits, lesion_labels.float())
+        else:
+            # Multi-class case: lesion_labels is [B, G] with class indices
+            return F.cross_entropy(lesion_logits.view(-1, self.num_lesion_types), lesion_labels.view(-1))
 
 
 class PatientLevelMultiTaskModel(nn.Module):
@@ -98,14 +156,15 @@ class PatientLevelMultiTaskModel(nn.Module):
     
     Key components:
     - Cross-attention between glomeruli and WSI tiles for spatial context
-    - Learnable lesion encoder for disease-specific representations
+    - Multi-head lesion embedding module for disease-specific representations
     - Multi-task heads with weighted loss combination
     """
     
     def __init__(self, 
                  glom_dim=768,
                  tile_dim=1536, 
-                 num_lesion_classes=2,
+                 num_lesion_classes=5,  # Changed from 2 to 5 for your lesion types
+                 lesion_embed_dim=768,
                  num_heads=8,
                  hidden_dim=1024,
                  dropout=0.1,
@@ -114,7 +173,7 @@ class PatientLevelMultiTaskModel(nn.Module):
         
         self.glom_dim = glom_dim
         self.tile_dim = tile_dim
-        self.num_lesion_classes = num_lesion_classes
+        self.num_lesion_classes = num_lesion_classes  # Now supports N lesions
         self.multi_label = multi_label
         
         # Positional encoding for tiles
@@ -140,16 +199,19 @@ class PatientLevelMultiTaskModel(nn.Module):
             dropout=dropout
         )
         
-        # Learnable lesion encoder
-        self.lesion_encoder = LesionEncoder(
-            num_lesions=num_lesion_classes,
-            embed_dim=glom_dim
+        # Multi-head lesion embedding module
+        self.lesion_embedding_module = LesionEmbeddingModule(
+            glom_dim=glom_dim,
+            num_lesion_types=num_lesion_classes,
+            lesion_embed_dim=lesion_embed_dim,
+            hidden_dim=512,
+            dropout=dropout
         )
         
         # Cross-attention: Glomeruli to Lesion encodings
         self.cross_attn_glom_lesion = CrossAttentionBlock(
             dim_q=glom_dim,
-            dim_kv=glom_dim,
+            dim_kv=lesion_embed_dim,
             num_heads=num_heads,
             dropout=dropout
         )
@@ -256,11 +318,15 @@ class PatientLevelMultiTaskModel(nn.Module):
             glom_embs, tile_embs_fused, glom_mask, tile_mask
         )
         
-        # Stage 3: Glomeruli-lesion cross-attention  
-        glom_final = self._glom_lesion_attention(glom_enhanced, B, G)
+        # Stage 3: Multi-head Lesion Embedding Module (use ORIGINAL glom embeddings)
+        lesion_embeddings, lesion_module_logits = self.lesion_embedding_module(glom_embs)  # Original, not enhanced
+        lesion_for_attention = self.lesion_embedding_module.get_lesion_embeddings_for_cross_attention(lesion_embeddings)
         
-        # Stage 4: Multi-task predictions
-        return self._compute_predictions(glom_final, glom_mask)
+        # Stage 4: Glomeruli-lesion cross-attention
+        glom_final = self._glom_lesion_attention(glom_enhanced, lesion_for_attention, B, G)
+        
+        # Stage 5: Multi-task predictions
+        return self._compute_predictions(glom_final, glom_mask, lesion_embeddings, lesion_module_logits)
     
     def _glom_tile_attention(self, glom_embs, tile_embs_fused, glom_mask, tile_mask):
         """Apply cross-attention between glomeruli and WSI tiles"""
@@ -293,15 +359,12 @@ class PatientLevelMultiTaskModel(nn.Module):
         
         return glom_enhanced
     
-    def _glom_lesion_attention(self, glom_enhanced, B, G):
-        """Apply cross-attention between glomeruli and lesion encodings"""
-        # Get lesion encodings
-        lesion_encodings = self.lesion_encoder(B)
-        
+    def _glom_lesion_attention(self, glom_enhanced, lesion_for_attention, B, G):
+        """Apply cross-attention between glomeruli and lesion embeddings"""
         # Reshape for cross-attention
         glom_flat = glom_enhanced.view(B * G, 1, self.glom_dim)
-        lesion_expanded = lesion_encodings.unsqueeze(1).expand(-1, G, -1, -1)
-        lesion_expanded = lesion_expanded.reshape(B * G, self.num_lesion_classes, self.glom_dim)
+        lesion_expanded = lesion_for_attention.unsqueeze(1).expand(-1, G, -1, -1)
+        lesion_expanded = lesion_expanded.reshape(B * G, self.num_lesion_classes, lesion_for_attention.shape[-1])
         
         # Cross-attention
         glom_lesion_out, _ = self.cross_attn_glom_lesion(
@@ -317,7 +380,7 @@ class PatientLevelMultiTaskModel(nn.Module):
         
         return glom_final
     
-    def _compute_predictions(self, glom_final, glom_mask):
+    def _compute_predictions(self, glom_final, glom_mask, lesion_embeddings, lesion_module_logits):
         """Compute all task predictions"""
         # Task 1: Individual glomeruli lesion classification
         glom_lesion_logits = self.glom_lesion_classifier(glom_final)
@@ -359,4 +422,6 @@ class PatientLevelMultiTaskModel(nn.Module):
             'lesion_coefficients': lesion_coefficients_norm,    # Learned lesion importance
             'glom_features': glom_final,                        # Final glom features
             'patient_features': glom_pooled,                    # Patient-level features
+            'lesion_embeddings': lesion_embeddings,             # Multi-head lesion embeddings
+            'lesion_module_logits': lesion_module_logits,       # Lesion module predictions
         }
