@@ -94,7 +94,7 @@ class ConceptTransformer(nn.Module):
         glom_dim: int = 768,
         tile_dim: int = 1536,
         lesion_embed_dim: int = 768,
-        num_lesions: int = 20,  # L: number of lesion concepts
+        num_lesions: int = 20,  # L: number of lesion
         num_heads: int = 8,
         hidden_dim: int = 512,
         dropout: float = 0.1,
@@ -552,4 +552,5 @@ class ConceptTransformerLoss(nn.Module):
         loss_dict['total_loss'] = total_loss
         
         return total_loss, loss_dict
+
 
