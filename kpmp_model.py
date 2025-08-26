@@ -78,7 +78,7 @@ class CrossAttentionBlock(nn.Module):
 
 class ConceptTransformer(nn.Module):
     """
-    Concept Transformer for Diabetic Nephropathy classification
+    Concept Transformer
     
     Key components:
     - X_{G-T}: Glom-tile embeddings from first cross-attention
@@ -552,3 +552,4 @@ class ConceptTransformerLoss(nn.Module):
         loss_dict['total_loss'] = total_loss
         
         return total_loss, loss_dict
+
